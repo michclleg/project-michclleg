@@ -1,0 +1,356 @@
+#define _POSIX_C_SOURCE 200112L
+ 
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <math.h>
+#include <errno.h>
+ 
+#include <sys/time.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+ 
+#include <gmp.h>
+ 
+/*
+* Chudnovsky algorithm using Binary Splitting:
+*
+* For the range [a, b) the algorithm will keep track of 3 numbers:
+*   P(a,b) - product of numerator factors
+*   Q(a,b) - product of denominator factors
+*   T(a,b) - the actual contribution to the sum
+*   sum ≈ T / Q
+*
+* When the range has only one term (base case):
+*   k == 0:
+*     P = 1,  Q = 1,  T = 13591409
+* If k > 0:
+*     P = -(6k-5)(2k-1)(6k-1)           Product of factors
+*     Q = k^3 * 10939058860032000       Denominator scaling
+*     T = 13591409 + 545140134*k        Term value
+*
+* Now, split the range into two halves: 
+*   Left:  [a, m) 
+*   Right: [m, b)   Where each half already has its own P, Q, T..
+*
+* To merge [a,m) and [m,b):
+*   T_out = Q_r * T_l  +  P_l * T_r
+*   P_out = P_l * P_r
+*   Q_out = Q_l * Q_r
+* The formula cross multiplies to keep in integer form and precision..
+* After combining, we have T(0,N) & Q(0,N)
+*
+* Now on the coordinator's side:
+*   pi = 426880 * sqrt(10005) * Q(0,N) / T(0,N)
+* 
+*/
+ 
+#define C3_STR           "10939058860032000"   /* 640320^3 / 24 */
+#define SOCKET_TIMEOUT_S  600
+#define RECV_BUFSIZE      4096
+ 
+typedef struct { mpz_t P, Q, T; } pqt_t;
+ 
+static void pqt_init(pqt_t *x)
+{
+   mpz_init(x->P);
+   mpz_init(x->Q);
+   mpz_init(x->T);
+}
+ 
+static void pqt_clear(pqt_t *x)
+{
+   mpz_clear(x->P);
+   mpz_clear(x->Q);
+   mpz_clear(x->T);
+}
+ 
+static void pqt_merge(pqt_t *out, const pqt_t *l, const pqt_t *r)
+{
+   mpz_t t1, t2;
+   mpz_init(t1);
+   mpz_init(t2);
+ 
+   mpz_mul(t1, r->Q, l->T);   /* Q_r * T_l */
+   mpz_mul(t2, l->P, r->T);   /* P_l * T_r */
+   mpz_add(out->T, t1, t2);
+ 
+   mpz_mul(out->P, l->P, r->P);
+   mpz_mul(out->Q, l->Q, r->Q);
+ 
+   mpz_clear(t1);
+   mpz_clear(t2);
+}
+ 
+static void bs(long long a, long long b, pqt_t *out)
+{
+   if (b == a + 1) {
+       long long k = a;
+       if (k == 0) {
+           mpz_set_ui(out->P, 1UL);
+           mpz_set_ui(out->Q, 1UL);
+           mpz_set_ui(out->T, 13591409UL);
+           return;
+       }
+ 
+       /* P = -(6k-5)(2k-1)(6k-1) */
+       mpz_set_si(out->P, 6*k - 5);
+       mpz_mul_si(out->P, out->P, 2*k - 1);
+       mpz_mul_si(out->P, out->P, 6*k - 1);
+       mpz_neg(out->P, out->P);
+ 
+       /* Q = k^3 * C3 */
+       mpz_t c3;
+       mpz_init(c3);
+       mpz_set_str(c3, C3_STR, 10);
+       mpz_set_si(out->Q, k);
+       mpz_pow_ui(out->Q, out->Q, 3);
+       mpz_mul(out->Q, out->Q, c3);
+       mpz_clear(c3);
+ 
+       /* T = a(k) = 13591409 + 545140134*k */
+       mpz_t ak; mpz_init(ak); mpz_set_str(ak, "545140134", 10);
+  mpz_mul_si(ak, ak, k); 
+  mpz_add_ui(ak, ak, 13591409UL); 
+  mpz_mul(out->T, out->P, ak); 
+  mpz_clear(ak);
+       return;
+   }
+ 
+   long long mid = (a + b) / 2;
+   pqt_t l, r;
+   pqt_init(&l);
+   pqt_init(&r);
+   bs(a,   mid, &l);
+   bs(mid, b,   &r);
+   pqt_merge(out, &l, &r);
+   pqt_clear(&l);
+   pqt_clear(&r);
+}
+ 
+/* JSON helpers */
+ 
+static int json_get_ll(const char *json, const char *key, long long *out)
+{
+   char pat[64];
+   snprintf(pat, sizeof(pat), "\"%s\":", key);
+ 
+   const char *p = strstr(json, pat);
+   if (!p) return 0;
+   p += strlen(pat);
+ 
+   while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')
+       p++;
+ 
+   char *end;
+   errno = 0;
+   long long v = strtoll(p, &end, 10);
+   if (end == p || errno != 0) return 0;
+ 
+   *out = v;
+   return 1;
+}
+ 
+/* Network helpers */
+ 
+static ssize_t read_line(int fd, char **buf_out)
+{
+   size_t cap  = RECV_BUFSIZE;
+   size_t used = 0;
+   char  *buf  = malloc(cap);
+   if (!buf) return -1;
+ 
+   while (1) {
+       if (used + 2 >= cap) {
+           cap *= 2;
+           char *nb = realloc(buf, cap);
+           if (!nb) { free(buf); return -1; }
+           buf = nb;
+       }
+       char c;
+       ssize_t r = recv(fd, &c, 1, 0);
+       if (r <= 0) break;
+       buf[used++] = c;
+       if (c == '\n') break;
+   }
+   buf[used] = '\0';
+   *buf_out = buf;
+   return (ssize_t)used;
+}
+ 
+/* Handle one coordinator connection */
+ 
+static void handle_connection(int client_fd)
+{
+   /* Set timeout on the accepted socket (not the listening socket) */
+   struct timeval tv = { .tv_sec = SOCKET_TIMEOUT_S, .tv_usec = 0 };
+   setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+   setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+ 
+   char *line = NULL;
+   ssize_t n = read_line(client_fd, &line);
+   if (n <= 0 || !line) {
+       fprintf(stderr, "[worker] failed to read task\n");
+       free(line);
+       return;
+   }
+   printf("[worker] received: %s", line);
+ 
+   long long a = 0, b = 0, digits = 0;
+   if (!json_get_ll(line, "a",      &a)      ||
+       !json_get_ll(line, "b",      &b)      ||
+       !json_get_ll(line, "digits", &digits)) {
+       fprintf(stderr, "[worker] malformed task JSON: %s\n", line);
+       free(line);
+       return;
+   }
+   free(line);
+ 
+   if (b <= a) {
+       fprintf(stderr, "[worker] empty k-range [%lld, %lld)\n", a, b);
+       return;
+   }
+ 
+   printf("[worker] computing k=[%lld, %lld)  (%lld terms) for %lld digits\n",
+          a, b, b - a, digits);
+   fflush(stdout);
+ 
+   pqt_t result;
+   pqt_init(&result);
+   bs(a, b, &result);
+ 
+   /* Encode P, Q, T as hex strings */
+   char *Phex = mpz_get_str(NULL, 16, result.P);
+   char *Qhex = mpz_get_str(NULL, 16, result.Q);
+   char *Thex = mpz_get_str(NULL, 16, result.T);
+ 
+   if (!Phex || !Qhex || !Thex) {
+       fprintf(stderr, "[worker] mpz_get_str returned NULL\n");
+       goto cleanup;
+   }
+ 
+   {
+       size_t resp_len = strlen(Phex) + strlen(Qhex) + strlen(Thex) + 64;
+       char  *resp     = malloc(resp_len);
+       if (!resp) {
+           fprintf(stderr, "[worker] out of memory building response\n");
+           goto cleanup;
+       }
+ 
+       int written = snprintf(resp, resp_len,
+                              "{\"P\":\"%s\",\"Q\":\"%s\",\"T\":\"%s\"}\n",
+                              Phex, Qhex, Thex);
+ 
+       size_t sent  = 0;
+       size_t total = (size_t)written;
+       while (sent < total) {
+           ssize_t r = send(client_fd, resp + sent, total - sent, 0);
+           if (r <= 0) {
+               fprintf(stderr, "[worker] send() failed: %s\n", strerror(errno));
+               break;
+           }
+           sent += (size_t)r;
+       }
+       printf("[worker] sent response (%zu bytes)\n", sent);
+       free(resp);
+   }
+ 
+cleanup:
+   free(Phex);
+   free(Qhex);
+   free(Thex);
+   pqt_clear(&result);
+}
+ 
+/* main */
+ 
+int main(int argc, char **argv)
+{
+   if (argc != 2) {
+       fprintf(stderr, "Usage: %s <port>\n", argv[0]);
+       return 1;
+   }
+ 
+   char *endptr;
+   errno = 0;
+   long port_l = strtol(argv[1], &endptr, 10);
+   if (*endptr != '\0' || errno != 0 || port_l < 1 || port_l > 65535) {
+       fprintf(stderr, "Error: invalid port '%s'\n", argv[1]);
+       return 1;
+   }
+   int port = (int)port_l;
+ 
+   int server_fd = socket(AF_INET6, SOCK_STREAM, 0);
+   int use_ipv6  = (server_fd >= 0);
+   if (!use_ipv6) {
+       server_fd = socket(AF_INET, SOCK_STREAM, 0);
+       if (server_fd < 0) { perror("socket"); return 1; }
+   }
+ 
+   int opt = 1;
+   setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+ 
+   if (use_ipv6) {
+       int off = 0;
+       setsockopt(server_fd, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof(off));
+   }
+ 
+   if (use_ipv6) {
+       struct sockaddr_in6 addr;
+       memset(&addr, 0, sizeof(addr));
+       addr.sin6_family = AF_INET6;
+       addr.sin6_addr   = in6addr_any;
+       addr.sin6_port   = htons((uint16_t)port);
+       if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+           perror("bind"); close(server_fd); return 1;
+       }
+   } else {
+       struct sockaddr_in addr;
+       memset(&addr, 0, sizeof(addr));
+       addr.sin_family      = AF_INET;
+       addr.sin_addr.s_addr = INADDR_ANY;
+       addr.sin_port        = htons((uint16_t)port);
+       if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+           perror("bind"); close(server_fd); return 1;
+       }
+   }
+ 
+   if (listen(server_fd, 8) < 0) {
+       perror("listen"); close(server_fd); return 1;
+   }
+ 
+   printf("[worker] listening on port %d (IPv%s)\n",
+          port, use_ipv6 ? "4/6" : "4");
+   fflush(stdout);
+ 
+   while (1) {
+       struct sockaddr_storage peer_addr;
+       socklen_t peer_len = sizeof(peer_addr);
+ 
+       int client_fd = accept(server_fd, (struct sockaddr *)&peer_addr, &peer_len);
+       if (client_fd < 0) { perror("accept"); continue; }
+ 
+       char peer_str[INET6_ADDRSTRLEN] = "unknown";
+       if (peer_addr.ss_family == AF_INET)
+           inet_ntop(AF_INET,  &((struct sockaddr_in  *)&peer_addr)->sin_addr,
+                     peer_str, sizeof(peer_str));
+       else if (peer_addr.ss_family == AF_INET6)
+           inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&peer_addr)->sin6_addr,
+                     peer_str, sizeof(peer_str));
+ 
+       printf("[worker] connection from %s\n", peer_str);
+       fflush(stdout);
+ 
+       handle_connection(client_fd);
+       close(client_fd);
+   }
+ 
+   close(server_fd);
+   return 0;
+}
+
+
