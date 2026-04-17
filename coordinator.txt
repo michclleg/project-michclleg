@@ -1,0 +1,495 @@
+#define _POSIX_C_SOURCE 200112L
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <math.h>
+#include <time.h>
+#include <errno.h>
+#include <pthread.h>
+
+#include <sys/time.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netdb.h>
+#include <unistd.h>
+#include <netinet/in.h>
+
+#include <gmp.h>
+
+/*
+ * Coordinator for distributed Chudnovsky pi calculation.
+ * Workers return (P, Q, T) for their assigned k-range. (See worker.c)
+ * Coordinator merges with:
+ *   T_out = Q_r * T_l  +  P_l * T_r
+ *   P_out = P_l * P_r
+ *   Q_out = Q_l * Q_r
+ *
+ * Final:
+ *   pi = 426880 * sqrt(10005) * Q / T
+ * 
+ */
+
+#define DIGITS_PER_TERM   14.181647462725477
+#define SOCKET_TIMEOUT_S  600
+#define RECV_BUFSIZE      4096
+#define MAX_WORKERS       256
+#define MAX_ADDR_LEN      256
+#define MAX_PREVIEW       72
+
+typedef struct { mpz_t P, Q, T; } pqt_t;
+
+static void pqt_init(pqt_t *x)
+{
+    mpz_init(x->P);
+    mpz_init(x->Q);
+    mpz_init(x->T);
+}
+
+static void pqt_clear(pqt_t *x)
+{
+    mpz_clear(x->P);
+    mpz_clear(x->Q);
+    mpz_clear(x->T);
+}
+
+static void pqt_merge(pqt_t *out, const pqt_t *l, const pqt_t *r)
+{
+    mpz_t t1, t2;
+    mpz_init(t1);
+    mpz_init(t2);
+
+    mpz_mul(t1, r->Q, l->T);   /* Q_r * T_l */
+    mpz_mul(t2, l->P, r->T);   /* P_l * T_r */
+    mpz_add(out->T, t1, t2);
+
+    mpz_mul(out->P, l->P, r->P);
+    mpz_mul(out->Q, l->Q, r->Q);
+
+    mpz_clear(t1);
+    mpz_clear(t2);
+}
+
+/* Tree-reduce an array of pqt_t in-place; arr[0] holds the total after. */
+static void tree_reduce(pqt_t *arr, int n)
+{
+    while (n > 1) {
+        int next = 0;
+        for (int i = 0; i < n; i += 2) {
+            if (i + 1 < n) {
+                pqt_t merged;
+                pqt_init(&merged);
+                pqt_merge(&merged, &arr[i], &arr[i + 1]);
+                pqt_clear(&arr[i]);
+                pqt_clear(&arr[i + 1]);
+                arr[next++] = merged;
+            } else {
+                arr[next++] = arr[i];
+            }
+        }
+        n = next;
+    }
+}
+
+/* Finalise pi from (Q, T):
+ *   pi = 426880 * sqrt(10005) * Q / T
+ */
+static char *finalise_pi(const mpz_t Q, const mpz_t T, int digits)
+{
+    mp_bitcnt_t prec = (mp_bitcnt_t)((digits + 10) * 3.321928094887362) + 512;
+    mpf_set_default_prec(prec);
+
+    mpf_t fQ, fT, sqrtD, num, pi, c426880;
+    mpf_init2(fQ, prec);
+    mpf_init2(fT, prec);
+    mpf_init2(sqrtD, prec);
+    mpf_init2(num, prec);
+    mpf_init2(pi, prec);
+    mpf_init2(c426880, prec);
+
+    mpf_set_z(fQ, Q);
+    mpf_set_z(fT, T);
+
+    /* sqrt(10005) */
+    mpf_set_ui(sqrtD, 10005);
+    mpf_sqrt(sqrtD, sqrtD);
+
+    /* num = 426880 * sqrt(10005) * Q */
+    mpf_set_ui(c426880, 426880UL);
+    mpf_mul(num, c426880, sqrtD);
+    mpf_mul(num, num, fQ);
+
+    /* pi = num / T */
+    mpf_div(pi, num, fT);
+
+    /* Convert to decimal string */
+    char *raw = NULL;
+    gmp_asprintf(&raw, "%.*Ff", digits + 10, pi);
+
+    /* Trim to exactly `digits` significant digits: "3." + (digits-1) chars */
+    size_t want = 2 + (size_t)(digits - 1);
+    char *out = malloc(want + 2);
+    if (out) {
+        strncpy(out, raw, want);
+        out[want] = '\0';
+    }
+
+    free(raw);
+    mpf_clear(fQ); mpf_clear(fT);
+    mpf_clear(sqrtD); mpf_clear(num);
+    mpf_clear(pi); mpf_clear(c426880);
+
+    return out;
+}
+
+/* Timing ------------------------------------------------------------------ */
+
+static double now_s(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
+/* Range splitting --------------------------------------------------------- */
+
+static long long terms_needed(int digits)
+{
+    return (long long)ceil((digits + 10) / DIGITS_PER_TERM) + 1;
+}
+
+static void split_range(long long n_terms, int n_workers,
+                         long long *starts, long long *ends)
+{
+    long long size  = n_terms / n_workers;
+    long long extra = n_terms % n_workers;
+    long long start = 0;
+    for (int i = 0; i < n_workers; i++) {
+        long long end = start + size + (i < extra ? 1 : 0);
+        starts[i] = start;
+        ends[i]   = end;
+        start     = end;
+    }
+}
+
+/* Per-worker task --------------------------------------------------------- */
+
+typedef struct {
+    int         index;
+    char        host[MAX_ADDR_LEN];
+    int         port;
+    long long   a;
+    long long   b;
+    int         digits;
+    pqt_t       result;
+    int         ok;
+    char        errmsg[256];
+    double      elapsed_s;
+} worker_task_t;
+
+/* Minimal JSON string extractor — finds value of `key` in a flat JSON object. */
+static char *json_get_string(const char *json, const char *key)
+{
+    char pat[128];
+    snprintf(pat, sizeof(pat), "\"%s\":\"", key);
+    const char *p = strstr(json, pat);
+    if (!p) return NULL;
+    p += strlen(pat);
+    const char *end = strchr(p, '"');
+    if (!end) return NULL;
+    size_t len = (size_t)(end - p);
+    char *val = malloc(len + 1);
+    if (!val) return NULL;
+    memcpy(val, p, len);
+    val[len] = '\0';
+    return val;
+}
+
+static void contact_worker(worker_task_t *task)
+{
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%d", task->port);
+
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family   = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    if (getaddrinfo(task->host, port_str, &hints, &res) != 0) {
+        snprintf(task->errmsg, sizeof(task->errmsg),
+                 "getaddrinfo failed for %s:%d", task->host, task->port);
+        task->ok = 0;
+        return;
+    }
+
+    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (fd < 0) {
+        snprintf(task->errmsg, sizeof(task->errmsg),
+                 "socket() failed: %s", strerror(errno));
+        freeaddrinfo(res);
+        task->ok = 0;
+        return;
+    }
+
+    struct timeval tv = { .tv_sec = SOCKET_TIMEOUT_S, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    if (connect(fd, res->ai_addr, res->ai_addrlen) != 0) {
+        snprintf(task->errmsg, sizeof(task->errmsg),
+                 "connect() to %s:%d failed: %s",
+                 task->host, task->port, strerror(errno));
+        freeaddrinfo(res);
+        close(fd);
+        task->ok = 0;
+        return;
+    }
+    freeaddrinfo(res);
+
+    /* Send task JSON */
+    char msg[256];
+    int msg_len = snprintf(msg, sizeof(msg),
+                           "{\"a\":%lld,\"b\":%lld,\"digits\":%d}\n",
+                           task->a, task->b, task->digits);
+    if (send(fd, msg, (size_t)msg_len, 0) != (ssize_t)msg_len) {
+        snprintf(task->errmsg, sizeof(task->errmsg),
+                 "send() failed: %s", strerror(errno));
+        close(fd);
+        task->ok = 0;
+        return;
+    }
+
+    /* Read response */
+    size_t  cap  = RECV_BUFSIZE;
+    char   *resp = malloc(cap);
+    if (!resp) {
+        close(fd);
+        task->ok = 0;
+        snprintf(task->errmsg, sizeof(task->errmsg), "out of memory");
+        return;
+    }
+    size_t used = 0;
+
+    while (1) {
+        if (used + RECV_BUFSIZE >= cap) {
+            cap *= 2;
+            char *nr = realloc(resp, cap);
+            if (!nr) {
+                free(resp);
+                close(fd);
+                task->ok = 0;
+                snprintf(task->errmsg, sizeof(task->errmsg), "out of memory");
+                return;
+            }
+            resp = nr;
+        }
+        ssize_t r = recv(fd, resp + used, RECV_BUFSIZE, 0);
+        if (r <= 0) break;
+        used += (size_t)r;
+        if (memchr(resp, '\n', used)) break;
+    }
+    resp[used < cap ? used : cap - 1] = '\0';
+    close(fd);
+
+    /* Parse P, Q, T hex strings from JSON response */
+    char *Phex = json_get_string(resp, "P");
+    char *Qhex = json_get_string(resp, "Q");
+    char *Thex = json_get_string(resp, "T");
+    free(resp);
+
+    if (!Phex || !Qhex || !Thex) {
+        snprintf(task->errmsg, sizeof(task->errmsg),
+                 "malformed response from worker %s:%d", task->host, task->port);
+        free(Phex); free(Qhex); free(Thex);
+        task->ok = 0;
+        return;
+    }
+
+    pqt_init(&task->result);
+    mpz_set_str(task->result.P, Phex, 16);
+    mpz_set_str(task->result.Q, Qhex, 16);
+    mpz_set_str(task->result.T, Thex, 16);
+
+    free(Phex); free(Qhex); free(Thex);
+    task->ok = 1;
+}
+
+static void *worker_thread(void *arg)
+{
+    worker_task_t *task = (worker_task_t *)arg;
+    double t0 = now_s();
+    contact_worker(task);
+    task->elapsed_s = now_s() - t0;
+    return NULL;
+}
+
+/* main -------------------------------------------------------------------- */
+
+int main(int argc, char **argv)
+{
+    if (argc < 3) {
+        fprintf(stderr,
+            "Usage: %s <digits> <host1:port1> [host2:port2 ...]\n"
+            "  digits : 1 - 1,000,000\n"
+            "  Example: %s 1000000 127.0.0.1:5000 10.0.0.2:5000\n",
+            argv[0], argv[0]);
+        return 1;
+    }
+
+    char *endptr;
+    errno = 0;
+    long digits_l = strtol(argv[1], &endptr, 10);
+    if (*endptr != '\0' || errno != 0 || digits_l < 1 || digits_l > 10000000) {
+        fprintf(stderr, "Error: digits must be between 1 and 10,000,000.\n");
+        return 1;
+    }
+    int digits = (int)digits_l;
+
+    int n_workers = argc - 2;
+    if (n_workers > MAX_WORKERS) {
+        fprintf(stderr, "Error: too many workers (max %d).\n", MAX_WORKERS);
+        return 1;
+    }
+
+    /* Parse host:port pairs */
+    worker_task_t tasks[MAX_WORKERS];
+    memset(tasks, 0, sizeof(tasks));
+
+    for (int i = 0; i < n_workers; i++) {
+        char *spec  = argv[i + 2];
+        char *colon = strrchr(spec, ':');
+        if (!colon) {
+            fprintf(stderr,
+                    "Error: invalid worker address '%s' (expected HOST:PORT).\n", spec);
+            return 1;
+        }
+        size_t hlen = (size_t)(colon - spec);
+        if (hlen >= MAX_ADDR_LEN) {
+            fprintf(stderr, "Error: hostname too long in '%s'.\n", spec);
+            return 1;
+        }
+        strncpy(tasks[i].host, spec, hlen);
+        tasks[i].host[hlen] = '\0';
+        tasks[i].port   = atoi(colon + 1);
+        tasks[i].index  = i;
+        tasks[i].digits = digits;
+    }
+
+    long long n_terms = terms_needed(digits);
+    long long starts[MAX_WORKERS], ends[MAX_WORKERS];
+    split_range(n_terms, n_workers, starts, ends);
+
+    for (int i = 0; i < n_workers; i++) {
+        tasks[i].a = starts[i];
+        tasks[i].b = ends[i];
+    }
+
+    printf("============================================================\n");
+    printf("  Pi Coordinator (C / GMP)\n");
+    printf("============================================================\n");
+    printf("  Target digits : %d\n", digits);
+    printf("  Series terms  : %lld  (Chudnovsky, ~14.18 digits/term)\n", n_terms);
+    printf("  Workers       : %d\n", n_workers);
+    printf("============================================================\n");
+    for (int i = 0; i < n_workers; i++) {
+        printf("  Worker %2d  %s:%d  k=[%lld, %lld)  (%lld terms)\n",
+               i + 1, tasks[i].host, tasks[i].port,
+               tasks[i].a, tasks[i].b, tasks[i].b - tasks[i].a);
+    }
+    printf("\n");
+
+    /* Dispatch workers in parallel */
+    double t_dispatch = now_s();
+    pthread_t threads[MAX_WORKERS];
+    int n_launched = 0;
+
+    for (int i = 0; i < n_workers; i++) {
+        if (pthread_create(&threads[i], NULL, worker_thread, &tasks[i]) != 0) {
+            fprintf(stderr, "Error: pthread_create failed for worker %d.\n", i + 1);
+            /* Join all already-launched threads before bailing out */
+            for (int j = 0; j < n_launched; j++)
+                pthread_join(threads[j], NULL);
+            return 1;
+        }
+        n_launched++;
+    }
+
+    int any_failed = 0;
+    for (int i = 0; i < n_workers; i++) {
+        pthread_join(threads[i], NULL);
+        if (tasks[i].ok) {
+            printf("  [+] Worker %d (%s:%d) returned in %.3fs\n",
+                   i + 1, tasks[i].host, tasks[i].port, tasks[i].elapsed_s);
+        } else {
+            printf("  [!] Worker %d (%s:%d) FAILED: %s\n",
+                   i + 1, tasks[i].host, tasks[i].port, tasks[i].errmsg);
+            any_failed = 1;
+        }
+    }
+
+    if (any_failed) {
+        fprintf(stderr, "\nAborting: one or more workers failed.\n");
+        return 1;
+    }
+
+    double t_collected = now_s();
+    printf("\n  All workers returned in %.3fs\n", t_collected - t_dispatch);
+
+    /* Deep-copy results via mpz_swap into freshly init'd structs to avoid
+     * mpz_t handle aliasing between tasks[] and the reduce array. */
+    pqt_t results[MAX_WORKERS];
+    for (int i = 0; i < n_workers; i++) {
+        pqt_init(&results[i]);
+        mpz_swap(results[i].P, tasks[i].result.P);
+        mpz_swap(results[i].Q, tasks[i].result.Q);
+        mpz_swap(results[i].T, tasks[i].result.T);
+        pqt_clear(&tasks[i].result);
+    }
+
+    /* Tree-reduce */
+    printf("  Reducing partial results ... ");
+    fflush(stdout);
+    double t_reduce = now_s();
+    tree_reduce(results, n_workers);
+    printf("done (%.3fs)\n", now_s() - t_reduce);
+
+    /* Finalise pi */
+    printf("  Computing final Pi ... ");
+    fflush(stdout);
+    double t_final = now_s();
+    char *pi_str = finalise_pi(results[0].Q, results[0].T, digits);
+    printf("done (%.3fs)\n", now_s() - t_final);
+
+    pqt_clear(&results[0]);
+
+    if (!pi_str) {
+        fprintf(stderr, "Error: failed to materialise Pi.\n");
+        return 1;
+    }
+
+    /* Write output file */
+    char out_path[64];
+    snprintf(out_path, sizeof(out_path), "pi_%d.txt", digits);
+    FILE *f = fopen(out_path, "w");
+    if (!f) {
+        fprintf(stderr, "Error: cannot open %s for writing.\n", out_path);
+        free(pi_str);
+        return 1;
+    }
+    fprintf(f, "%s\n", pi_str);
+    fclose(f);
+
+    double total = now_s() - t_dispatch;
+    printf("\n  Total wall time : %.3fs\n", total);
+    printf("  Output          : %s\n", out_path);
+
+    char preview[MAX_PREVIEW + 4];
+    strncpy(preview, pi_str, MAX_PREVIEW);
+    preview[MAX_PREVIEW] = '\0';
+    printf("\n  Pi = %s...\n", preview);
+    printf("============================================================\n\n");
+
+    free(pi_str);
+    return 0;
+}
