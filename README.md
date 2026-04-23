@@ -5,7 +5,7 @@ A distributed large scale calculator for π using the Chudnovsky algorithm and b
 
 Files:
 ┌──────────────────────────────────────────────────────────────┐
-│                     Coordinator (Node 1)                     │
+|                     Coordinator (Node 1)                     │
 │  - Splits term range across 10 worker slots                  │
 │  - Dispatches JSON tasks in parallel                         │
 │  - Tree-reduces returned (P, Q, T) tuples                    │
