@@ -2,7 +2,7 @@
 Distributed Pi Calculator:
 
 A distributed large scale calculator for π using the Chudnovsky algorithm and binary splitting across 5 FABRIC nodes.
-
+```
 ┌──────────────────────────────────────────────────────────────┐
 │                     Coordinator (Node 1)                     │
 │  - Splits term range across 10 worker slots                  │
@@ -17,7 +17,7 @@ A distributed large scale calculator for π using the Chudnovsky algorithm and b
  :5000/:5001  :5000/:5001  :5000/:5001
   (2 workers   (2 workers   (2 workers
    per node)    per node)    per node)
-
+```
 
 
 Workers: All five nodes, two processes each on ports 5000/5001, accept a JSON task containing a k-range [a, b) and the digit target, run binary splitting over that range, and return the three integers P, Q, T as hex-encoded strings in a JSON response.
