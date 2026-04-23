@@ -34,6 +34,6 @@ Prerequisites:
 - coordinator.c and worker.c in the working directory
 - Update project_id in the notebook before running
 
-Run the project end-to-end using Notebook.ipynb. The coordinator prints a progress table as workers return, then writes the final value to pi_<digits>.txt. By default the coordinator enforces a hard limit of 10,000,000 digits. To raise it, patch the constant in coordinator.c and recompile as shown in cell 10 of the notebook.
+Run the project end-to-end using Notebook.ipynb. The coordinator prints a progress table as workers return, then writes the final value to 'pi_(digits).txt'. By default the coordinator enforces a hard limit of 10,000,000 digits. To raise it, patch the constant in coordinator.c and recompile as shown in cell 10 of the notebook.
 
 Link to video demo: https://youtu.be/AfcKvwYpENk 
