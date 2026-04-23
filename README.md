@@ -21,7 +21,7 @@ A distributed large scale calculator for π using the Chudnovsky algorithm and b
 
 
 Workers: All five nodes, two processes each on ports 5000/5001, accept a JSON task containing a k-range [a, b) and the digit target, run binary splitting over that range, and return the three integers P, Q, T as hex-encoded strings in a JSON response.
-Coordinator: Node 1 parses command-line arguments, divides the total term count across all ten worker slots, dispatches tasks in parallel, tree-reduces the returned partial (P,Q,T) tuples, and finally computes =42688010005 Q/T using GMP floating-point arithmetic at the requested precision
+Coordinator: Node 1 parses command-line arguments, divides the total term count across all ten worker slots, dispatches tasks in parallel, tree-reduces the returned partial (P,Q,T) tuples, and finally computes pi using GMP floating-point arithmetic at the requested precision
 
 Notebook.ipynb: Orchestration notebook
 Coordinator.c: Dispatches tasks to workers, tree reduces results and computes pi.
